@@ -39,6 +39,10 @@ scanning:
 
 These are independent limits, not reserved time slices: a download approaching 10 minutes followed by a 16-minute scan would still exceed an 18-minute response deadline. Any reverse proxy in front of the server also needs sufficient timeout allowance. The upstream transport's existing response-header timeout remains unchanged.
 
+### Memory limit
+
+On Linux, when the process runs under a cgroup memory limit, such as a container's `--memory` or a Kubernetes memory limit, `proxy serve` sets Go's soft memory limit to 80% of it and log the value at startup (`set Go memory limit from cgroup`). The garbage collector then runs more often as memory use approaches the limit, rather than letting the heap grow until the container is killed. The remaining 20% is left for memory Go doesn't manage, such as `git` processes the proxy runs. Set the `GOMEMLIMIT` environment variable to choose the value yourself, or `GOMEMLIMIT=off` to disable it.
+
 ## Storage
 
 The proxy stores cached artifacts using gocloud.dev/blob, supporting local filesystem and S3-compatible storage.
@@ -160,6 +164,8 @@ export AWS_ACCESS_KEY_ID=your-key
 export AWS_SECRET_ACCESS_KEY=your-secret
 export AWS_REGION=us-east-1
 ```
+
+Objects up to 16 MiB are buffered in memory and sent in one request. Larger ones are uploaded in 5 MiB parts, two at a time, so a large artifact being cached holds about 30 MiB of upload buffers. Azure Blob Storage uploads use the same part size and concurrency.
 
 ### S3-Compatible (MinIO, etc.)
 
@@ -1046,11 +1052,11 @@ Maven caveats:
 - Maven Central lists versions in version order, not in the order they were published. A patch to an older release line published after a newer release that is out of cooldown stays listed while it is in cooldown, but its files are still refused.
 - SNAPSHOT versions are not held back.
 
-RubyGems, Hex and PyPI keep their publish times outside the metadata clients read: the RubyGems versions API, the Hex HTTP API (`upstream.hex_api`) and the PyPI JSON API. The proxy fetches them alongside each compact index, package or simple page it filters, and for PyPI downloads. Cooldown fails closed: when it applies to a package and those times can't be fetched or parsed, or the metadata can't be rewritten, the request fails with 502, or with 503 and `Retry-After` while the upstream is rate limiting the proxy, instead of serving the metadata unfiltered. The same goes for npm, Composer and pub.dev metadata that can't be rewritten, and for npm tarball downloads whose publish time can't be read. A PyPI file or npm tarball that is already cached is still served when its publish time can't be read; only a download that would have to be fetched fails. Packages exempted with a duration of `0` are served as before and don't need the times. A PyPI package the JSON API returns 404 for has no times to go by and is served unfiltered.
+RubyGems, Hex and PyPI keep their publish times outside the metadata clients read: the RubyGems versions API, the Hex HTTP API (`upstream.hex_api`) and the PyPI JSON API. The proxy fetches them alongside each compact index, package or simple page it filters, and for PyPI downloads. Cooldown fails closed: when it applies to a package and those times can't be fetched or parsed, or the metadata can't be rewritten, the request fails with 502, or with 503 and `Retry-After` while the upstream is rate limiting the proxy, instead of serving the metadata unfiltered. The same goes for npm, Composer and pub.dev metadata that can't be rewritten, and for npm tarball downloads whose publish time can't be read. A PyPI file or npm tarball that is already cached is still served when its publish time can't be read; only a download that would have to be fetched fails. A PyPI release's time is the upload time of its newest file. The proxy stores it when a download looks it up, and serves files of that release that are already cached against the stored time without reading the JSON API again. A file that isn't cached yet is always looked up, since it may have been added to the release since, and the newer time is stored. Packages exempted with a duration of `0` are served as before and don't need the times. A PyPI package the JSON API returns 404 for has no times to go by and is served unfiltered.
 
 With cooldown on, the proxy asks npm for full packuments, since the abbreviated ones it uses otherwise carry no publish times. Abbreviated packuments cached before cooldown was turned on are fetched again in full rather than served, including as a stale copy when the upstream is down.
 
-Conda cooldown covers `repodata.json` and sharded repodata (CEP 16). Clients cache shards by the hash in the shard index, so with cooldown on the proxy serves a rewritten index whose shard hashes change every hour and filters each shard as it is fetched. Versions leaving cooldown show up within the hour, and clients fetch the shards they need again once an hour. If a channel's shard index points packages or shards somewhere the proxy doesn't route, the proxy answers 404 for it and clients fall back to `repodata.json`.
+Conda cooldown covers `repodata.json`, `current_repodata.json`, `repodata_from_packages.json` and sharded repodata (CEP 16). Other forms of the repodata, such as `repodata.json.zst`, `repodata.json.bz2` and `repodata.jlap` patches, would list versions still in cooldown, so with cooldown on they are answered 404 and conda and mamba fall back to `repodata.json`. Clients cache shards by the hash in the shard index, so with cooldown on the proxy serves a rewritten index whose shard hashes change every hour and filters each shard as it is fetched. Versions leaving cooldown show up within the hour, and clients fetch the shards they need again once an hour. If a channel's shard index points packages or shards somewhere the proxy doesn't route, the proxy answers 404 for it and clients fall back to `repodata.json`.
 
 Note: Hex cooldown requires disabling registry signature verification since the proxy re-encodes the protobuf payload without the original signature. Set `HEX_NO_VERIFY_REPO_ORIGIN=1` or configure your repo with `no_verify: true`.
 
@@ -1273,11 +1279,15 @@ By default the proxy fetches metadata fresh from upstream on every request. Enab
 
 OCI manifests and tag lists are always cached because cached image blobs cannot be pulled without their manifests and offline clients may need tag resolution. Digest-addressed manifests are immutable and served directly from cache. Tag-addressed manifests and tag lists follow `metadata_ttl`, revalidate when stale, and fall back to the last cached response when the registry is unavailable.
 
+A stale tag is revalidated with a HEAD request carrying the client's `Accept` header, and the `Docker-Content-Digest` it returns is compared with the cached one. If the tag did not move, or moved to a manifest already cached by digest, nothing else is fetched. Otherwise the new manifest is fetched once by digest and stored under the tag and the digest. Docker Hub counts manifest GETs, but not HEADs, against its pull rate limit, so an unchanged tag costs no pulls however often its TTL runs out. A registry whose HEAD response has no digest gets a conditional GET for the tag instead. A client's HEAD request for a stale or uncached tag is passed on as a HEAD; when the digest it returns is cached, the tag is pointed at it, so the GET that follows is served from cache. Concurrent requests for the same manifest share one upstream request, and instances sharing a Postgres database take turns through the same [fetch lease](#several-instances) as other metadata.
+
 ```yaml
 cache_metadata: true
 ```
 
 Or via environment variable: `PROXY_CACHE_METADATA=true`.
+
+Some metadata never changes once published, and is cached like an artifact, with or without `cache_metadata`, and served without revalidation whatever `metadata_ttl` says: a Go module's `.mod` and `.info` for a canonical version (a release, pre-release, pseudo-version or `+incompatible` version; the checksum database fixes their content), and RPM repodata files named after their own checksum (`repodata/<sha256>-primary.xml.gz`). A stored copy is checked against the digest recorded for it and fetched again if it doesn't match. Go branch and commit queries, `@v/list` and `@latest`, and RPM `repomd.xml` and plainly named repodata files follow `metadata_ttl` as before. A checksum-named repodata file over `metadata_max_size` is streamed from upstream uncached.
 
 Composer archive downloads look up their upstream URL in the same cached metadata, so an archive is resolved without asking Packagist again and stays installable while it is down. Only a version or file the cached metadata does not list yet is looked up upstream. With or without `cache_metadata`, a cached archive of a tagged release from the default repository is served without any metadata lookup; with cooldown enabled it is checked against the publish time recorded when the archive was first resolved. Branch (dev) versions, routed packages and archives picked by a query string such as `?sha=` are always resolved from the metadata.
 
@@ -1319,7 +1329,7 @@ Or via environment variable: `PROXY_ARTIFACT_MAX_SIZE=2GB`.
 
 ### Rewritten metadata cache
 
-The npm and Composer handlers rewrite every metadata document they serve, so that download URLs point at the proxy. That means decoding the whole document and encoding it again, and Composer's minified documents are also expanded, which together cost milliseconds per typical package and far more for very large ones. The proxy keeps rewritten documents in memory, so each distinct upstream document is rewritten once and requests arriving while it is being rewritten wait for that rewrite. New bytes from upstream are rewritten again. With version cooldown enabled, a cached rewrite is kept for one minute only, because cooldown filtering depends on the current time: a version leaving cooldown shows up at most a minute late. Such documents are dated like any other, so clients that revalidate with `If-Modified-Since`, such as Composer, get `304 Not Modified`.
+The npm, Composer, PyPI and Helm handlers rewrite every metadata document they serve, so that download URLs point at the proxy. That means decoding the whole document and encoding it again, and Composer's minified documents are also expanded, which together cost milliseconds per typical package and far more for very large ones; a large Helm `index.yaml` takes over a hundred milliseconds. The proxy keeps rewritten documents in memory, so each distinct upstream document is rewritten once and requests arriving while it is being rewritten wait for that rewrite. New bytes from upstream are rewritten again. A PyPI simple page is cached per representation (HTML or JSON) and per set of versions filtered out of it. With version cooldown enabled, a cached rewrite is kept for one minute only, because cooldown filtering depends on the current time: a version leaving cooldown shows up at most a minute late. Cached documents carry an `ETag` of their own, and are dated like any other, so clients that revalidate with `If-None-Match` or `If-Modified-Since`, such as Composer, get `304 Not Modified`.
 
 Each cached document is also kept gzip-compressed, when that makes it smaller, and served with `Content-Encoding: gzip` to clients that accept it. A large packument is compressed once rather than on every request, by the proxy or by a reverse proxy in front of it. The compressed copy counts against the cache size and typically adds about an eighth to each entry. Documents rewritten outside the cache are served uncompressed.
 
@@ -1365,6 +1375,8 @@ hosted:
 | `hosted.composer_vendors` | `PROXY_HOSTED_COMPOSER_VENDORS` | Composer vendors served from pushed packages only |
 
 `hosted.enabled` cannot be combined with `storage.cache_artifacts: false`.
+
+With `hosted.enabled` off, archives pushed earlier stay in storage but are not served as hosted packages: package metadata doesn't list them, `/generic/hosted/` isn't served, and npm and Composer downloads take the normal proxy path, cooldown included. An upstream copy still never replaces a pushed archive.
 
 ### Pushing a patched package
 
@@ -1511,6 +1523,10 @@ The `proxy mirror` command pre-populates the cache from various sources. It acce
 Packages are downloaded from the configured upstreams: npm, cargo, gem, golang, hex, pub, maven and nuget from `upstream.npm`, `upstream.cargo_download`, `upstream.gem`, `upstream.go`, `upstream.hex`, `upstream.pub`, `upstream.maven` and `upstream.nuget`. npm packages in `upstream.npm_routes` come from their route and are cached under the route's keys, so clients get them from the cache as they would after an install. Mirror API jobs do the same.
 
 A PyPI version is mirrored with every file `upstream.pypi` lists for it: the sdist and each wheel, checked against the listed sha256 and cached under the name and version the download handler reads from the filename. Add the `file_name` qualifier to mirror one file, for example `pkg:pypi/zope.interface@7.2?file_name=zope.interface-7.2-cp312-cp312-macosx_11_0_arm64.whl`.
+
+A conda version is mirrored with every build anaconda.org lists for it, across all subdirs, and each build is cached the way `/conda/{channel}/{subdir}/{file}` serves it. Give the channel as the namespace or the `channel` qualifier, for example `pkg:conda/conda-forge/numpy@2.1.0`; a package without one is refused. The `subdir`, `build` and `type` qualifiers select builds, for example `pkg:conda/conda-forge/numpy@2.1.0?subdir=linux-64&type=conda`. Builds with a listed sha256 are checked against it. Files are listed from anaconda.org, so mirroring conda fails while `upstream.conda` points somewhere else.
+
+A Composer release is mirrored with the dist archive `upstream.composer` lists for it, checked against its shasum when one is listed, and cached under the name `/composer/files/...` serves it as. Give the version as the repository lists it, for example `pkg:composer/monolog/monolog@3.8.1`. Branches such as `dev-main` aren't mirrored, since their archive changes with every push, and neither are packages in `upstream.composer_routes`.
 
 | Flag | Default | Description |
 |------|---------|-------------|
